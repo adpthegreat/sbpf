@@ -23,6 +23,7 @@ serde = { workspace = true, features = ["derive"] }
 codespan-reporting = "0.12.0"
 termcolor = "1.4"
 
+sbpf-analyzer = {  workspace = true }
 sbpf-assembler = { workspace = true }
 sbpf-common = { workspace = true }
 sbpf-disassembler = { workspace = true }
@@ -34,6 +35,7 @@ hex-literal = "0.4.1"
 
 [workspace]
 members = [
+    "crates/analyzer",
     "crates/assembler",
     "crates/common",
     "crates/disassembler",
@@ -76,6 +78,7 @@ solana-rent = "4.1.0"
 solana-clock = "3.0.1"
 solana-epoch-schedule = "3.0.0"
 sbpf-assembler = { path = "crates/assembler", version = "0.1.8" }
+sbpf-analyzer = { path = "crates/analyzer", version = "0.1.8" }
 sbpf-disassembler = { path = "crates/disassembler", version = "0.1.8" }
 sbpf-debugger = { path = "crates/debugger", version = "0.1.8" }
 sbpf-common = { path = "crates/common", version = "0.1.8" }
