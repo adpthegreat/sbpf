@@ -316,7 +316,6 @@ fn tarjan_topo(blocks: &mut BTreeMap<usize, BasicBlock>) -> Vec<usize> {
             }
         }
 
-        // Root of an SCC?
         if nodes[v].discovery == nodes[v].lowlink {
             let mut idx_in_scc = 0;
             while let Some(w) = scc_stack.pop() {
@@ -426,4 +425,319 @@ fn intersect(
         }
     }
     b
+}
+
+#[cfg(test)]
+mod tests {
+    use sbpf_assembler::{Assembler, AssemblerOption};
+    use std::collections::BTreeSet;
+    use crate::{Analysis, cfg::CfgEdgeKind};
+    use crate::tests::{ELF_WITH_LABELS, ELF_SAME_TARGET, ELF_V3, analyze_asm};
+
+    #[test]
+    fn with_labels_parses() {
+        Analysis::from_elf_bytes(ELF_WITH_LABELS).unwrap();
+    }
+
+    #[test]
+    fn with_labels_instruction_count() {
+        let a = Analysis::from_elf_bytes(ELF_WITH_LABELS).unwrap();
+        assert_eq!(a.instructions.len(), 17, "expected 17 logical instructions, got {}", a.instructions.len());
+    }
+
+    #[test]
+    fn same_target_cfg_block_count() {
+        let a = Analysis::from_elf_bytes(ELF_SAME_TARGET).unwrap();
+        // PC0: call → splits to PC1. PC1: ja → splits to PC2.
+        // PC2: lddw (no split). PC3: call → splits to PC4. PC4: exit.
+        // Blocks: {0},{1},{2,3},{4} = 4 blocks.
+        assert_eq!(a.cfg.blocks.len(), 4);
+    }
+
+    #[test]
+    fn with_labels_cfg_no_empty_blocks() {
+        let a = Analysis::from_elf_bytes(ELF_WITH_LABELS).unwrap();
+        for (pc, block) in &a.cfg.blocks {
+            assert!(block.start < block.end, "empty block at PC {pc}");
+        }
+    }
+
+   #[test]
+   fn with_labels_entry_calls_fn_0068() {
+       let a = Analysis::from_elf_bytes(ELF_WITH_LABELS).unwrap();       
+       // PC 0 is `call fn_0068` — call splits the block, successor is the
+       // fall-through PC 1.
+       assert_eq!(a.cfg.blocks[&0].successors, vec![1]);
+   }
+
+    #[test]
+    fn with_labels_back_edge_to_jmp_0010() {
+        let a = Analysis::from_elf_bytes(ELF_WITH_LABELS).unwrap();
+        // jmp_0038 block ends with `ja jmp_0010` at PC 9.
+        // `call fn_0088` at PC 8 splits the block so PC 9 is its own block.
+        assert_eq!(a.cfg.blocks[&9].successors, vec![2]);
+    }
+
+    #[test]
+    fn with_labels_topological_order_complete() {
+        let a = Analysis::from_elf_bytes(ELF_WITH_LABELS).unwrap();
+        let topo: BTreeSet<usize> = a.cfg.topological_order.iter().copied().collect();
+        let block_starts: BTreeSet<usize> = a.cfg.blocks.keys().copied().collect();
+        assert_eq!(topo, block_starts);
+    }
+
+    #[test]
+    fn same_target_parses() {
+        Analysis::from_elf_bytes(ELF_SAME_TARGET).unwrap();
+    }
+
+    #[test]
+    fn same_target_instruction_count() {
+        let a = Analysis::from_elf_bytes(ELF_SAME_TARGET).unwrap();
+        assert_eq!(a.instructions.len(), 5, "expected 5 logical instructions, got {}", a.instructions.len());
+    }
+
+     #[test]
+    fn same_target_entry_successor() {
+        let a = Analysis::from_elf_bytes(ELF_SAME_TARGET).unwrap();
+        // PC0 is `call fn_0010`, splits to fall-through PC1.
+        assert_eq!(a.cfg.blocks[&0].successors, vec![1]);
+    }
+
+    #[test]
+    fn same_target_exit_block_no_successors() {
+        let a = Analysis::from_elf_bytes(ELF_SAME_TARGET).unwrap();
+        // PC4 is `exit` — the last block, no successors.
+        assert!(a.cfg.blocks[&4].successors.is_empty());
+    }
+
+    #[test]
+    fn v3_parses() {
+        Analysis::from_elf_bytes(ELF_V3).unwrap();
+    }
+
+    #[test]
+    fn v3_instruction_count() {
+        let a = Analysis::from_elf_bytes(ELF_V3).unwrap();
+        assert_eq!(a.instructions.len(), 3, "expected 3 logical instructions, got {}", a.instructions.len());
+    }
+
+   #[test]
+    fn v3_block_structure() {
+        let a = Analysis::from_elf_bytes(ELF_V3).unwrap();
+        // PC0: lddw. PC1: call sol_log_64_ → splits to PC2. PC2: exit.
+        // Blocks: {0,1},{2} = 2 blocks.
+        assert_eq!(a.cfg.blocks.len(), 2);
+        assert!(a.cfg.blocks[&2].successors.is_empty());
+    }
+
+    #[test]
+    fn cfg_single_block_sequential() {
+        let a = analyze_asm(r#"
+        .globl entrypoint
+        entrypoint:
+            mov64 r0, 1
+            mov64 r1, 2
+            add64 r0, r1
+            exit
+        "#);
+        assert_eq!(a.cfg.blocks.len(), 1);
+        assert!(a.cfg.blocks[&0].successors.is_empty());
+    }
+
+    #[test]
+    fn cfg_unconditional_jump() {
+        let a = analyze_asm(r#"
+        .globl entrypoint
+        entrypoint:
+            ja target
+        target:
+            mov64 r0, 0
+            exit
+        "#);
+        assert_eq!(a.cfg.blocks.len(), 2);
+        let entry = &a.cfg.blocks[&0];
+        assert_eq!(entry.successors.len(), 1);
+    }
+
+    #[test]
+    fn cfg_conditional_branch_two_successors() {
+        let a = analyze_asm(r#"
+        .globl entrypoint
+        entrypoint:
+            mov64 r0, 1
+            jeq r0, 1, taken
+            mov64 r1, 0
+            exit
+        taken:
+            mov64 r1, 1
+            exit
+        "#);
+        let entry_block = a.cfg.blocks.values().next().unwrap();
+        let entry_pc = entry_block.start;
+        let jeq_block = a.cfg.blocks.iter()
+            .find(|(_, b)| b.end - b.start >= 2)
+            .map(|(_, b)| b)
+            .unwrap();
+        assert_eq!(jeq_block.successors.len(), 2);
+    }
+
+    #[test]
+    fn cfg_loop_back_edge() {
+        let a = analyze_asm(r#"
+        .globl entrypoint
+        entrypoint:
+            mov64 r0, 0
+        loop:
+            add64 r0, 1
+            jlt r0, 10, loop
+            exit
+        "#);
+        assert!(a.cfg.blocks.len() >= 2);
+        let has_back_edge = a.cfg.blocks.values()
+            .any(|b| b.successors.iter().any(|&s| s <= b.start));
+        assert!(has_back_edge, "expected at least one back-edge");
+    }
+
+    #[test]
+    fn cfg_multiple_branches() {
+        let a = analyze_asm(r#"
+        .globl entrypoint
+        entrypoint:
+            mov64 r0, 5
+            jeq r0, 1, a
+            jeq r0, 2, b
+            ja done
+        a:
+            mov64 r1, 10
+            ja done
+        b:
+            mov64 r1, 20
+        done:
+            exit
+        "#);
+        assert!(a.cfg.blocks.len() >= 4);
+    }
+
+    #[test]
+    fn cfg_correct_jump_target() {
+        let a = analyze_asm(r#"
+        .globl entrypoint
+        entrypoint:
+            ja skip
+            mov64 r0, 99
+        skip:
+            mov64 r0, 1
+            exit
+        "#);
+        let entry = &a.cfg.blocks[&0];
+        assert_eq!(entry.successors.len(), 1);
+        assert_ne!(entry.successors[0], 1, "must skip over PC 1");
+    }
+
+    #[test]
+    fn cfg_block_boundaries_are_contiguous() {
+        let a = analyze_asm(r#"
+        .globl entrypoint
+        entrypoint:
+            mov64 r0, 5
+            jeq r0, 1, a
+            jeq r0, 2, b
+            ja done
+        a:
+            mov64 r1, 10
+            ja done
+        b:
+            mov64 r1, 20
+        done:
+            exit
+        "#);
+        let mut starts: Vec<usize> = a.cfg.blocks.keys().copied().collect();
+        starts.sort();
+        for i in 0..starts.len() - 1 {
+            assert_eq!(a.cfg.blocks[&starts[i]].end, starts[i + 1]);
+        }
+    }
+
+    #[test]
+    fn cfg_topological_order_covers_all_blocks() {
+        let a = analyze_asm(r#"
+        .globl entrypoint
+        entrypoint:
+            mov64 r0, 5
+            jeq r0, 1, a
+            jeq r0, 2, b
+            ja done
+        a:
+            mov64 r1, 10
+            ja done
+        b:
+            mov64 r1, 20
+        done:
+            exit
+        "#);
+        let topo: BTreeSet<usize> = a.cfg.topological_order.iter().copied().collect();
+        let keys: BTreeSet<usize> = a.cfg.blocks.keys().copied().collect();
+        assert_eq!(topo, keys);
+    }
+
+    #[test]
+    fn cfg_no_empty_blocks() {
+        let a = analyze_asm(r#"
+        .globl entrypoint
+        entrypoint:
+            mov64 r0, 5
+            jeq r0, 3, done
+            mov64 r1, 0
+        done:
+            exit
+        "#);
+        for (pc, block) in &a.cfg.blocks {
+            assert!(block.start < block.end, "empty block at PC {pc}");
+        }
+    }
+
+    #[test]
+    fn counter_example_cfg_generation() {
+        let src = include_str!(
+            "../../../examples/sbpf-asm-counter/src/sbpf-asm-counter/sbpf-asm-counter.s"
+        );
+        let a = analyze_asm(src);
+        assert!(a.cfg.blocks.len() >= 5, "counter: expected >=5 blocks, got {}", a.cfg.blocks.len());
+        for (pc, block) in &a.cfg.blocks {
+            assert!(block.start < block.end, "empty block at PC {pc}");
+        }
+    }
+
+    #[test]
+    fn counter_example_topological_order_complete() {
+        let src = include_str!(
+            "../../../examples/sbpf-asm-counter/src/sbpf-asm-counter/sbpf-asm-counter.s"
+        );
+        let a = analyze_asm(src);
+        let topo: BTreeSet<usize> = a.cfg.topological_order.iter().copied().collect();
+        let keys: BTreeSet<usize> = a.cfg.blocks.keys().copied().collect();
+        assert_eq!(topo, keys);
+    }
+
+    #[test]
+    fn vault_example_cfg_generation() {
+        let src = include_str!(
+            "../../../examples/sbpf-asm-vault/src/sbpf-asm-vault/sbpf-asm-vault.s"
+        );
+        let a = analyze_asm(src);
+        assert!(a.cfg.blocks.len() >= 3, "vault: expected >=3 blocks, got {}", a.cfg.blocks.len());
+        for (pc, block) in &a.cfg.blocks {
+            assert!(block.start < block.end, "empty block at PC {pc}");
+        }
+    }
+
+    #[test]
+    fn cpi_example_cfg_generation() {
+        let src = include_str!(
+            "../../../examples/sbpf-asm-cpi/src/sbpf-asm-cpi/sbpf-asm-cpi.s"
+        );
+        let a = analyze_asm(src);
+        assert!(a.cfg.blocks.len() >= 2, "cpi: expected >=2 blocks, got {}", a.cfg.blocks.len());
+    }
 }

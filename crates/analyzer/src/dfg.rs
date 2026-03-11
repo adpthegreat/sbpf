@@ -363,3 +363,219 @@ fn inter_block_data_flow(
         forward.remove(&DfgNode::Phi(pc));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{Analysis, dfg::{DataResource, DfgEdge, DfgEdgeKind, DfgNode}};
+    use crate::tests::{ELF_WITH_LABELS, analyze_asm};
+
+    #[test]
+    fn with_labels_dfg_lddw_feeds_call() {
+        let a = Analysis::from_elf_bytes(ELF_WITH_LABELS).unwrap();
+        // lddw r1,1 at PC 2 writes r1; call sol_log_64_ at PC 3 reads it.
+        let edges_into_3: Vec<&DfgEdge> = a.dfg.forward.values().flatten()
+            .filter(|e| e.destination == DfgNode::Instruction(3))
+            .collect();
+        assert!(
+            edges_into_3.iter().any(|e| e.kind == DfgEdgeKind::Filled
+                && e.resource == DataResource::Register(1)
+                && e.source == DfgNode::Instruction(2)),
+            "expected Filled r1 edge from PC 2 to PC 3, got {edges_into_3:?}"
+        );
+    }
+
+    #[test]
+    fn with_labels_dfg_non_empty() {
+        let a = Analysis::from_elf_bytes(ELF_WITH_LABELS).unwrap();
+        assert!(!a.dfg.forward.is_empty());
+    }
+
+    #[test]
+    fn v3_dfg_lddw_feeds_call() {
+        let a = analyze_asm(r#"
+        .globl entrypoint
+        entrypoint:
+            lddw r1, 1
+            call sol_log_64_
+            exit
+        "#);
+        let edges: Vec<&DfgEdge> = a.dfg.forward.values().flatten()
+            .filter(|e| e.destination == DfgNode::Instruction(1)
+                && e.resource == DataResource::Register(1)
+                && e.kind == DfgEdgeKind::Filled)
+            .collect();
+        assert!(!edges.is_empty(), "expected Filled r1 edge PC 0→1, got none");
+    }
+
+    #[test]
+    fn dfg_register_read_after_write() {
+        let a = analyze_asm(r#"
+        .globl entrypoint
+        entrypoint:
+            mov64 r1, 42
+            mov64 r2, r1
+            exit
+        "#);
+        let filled: Vec<&DfgEdge> = a.dfg.forward.values().flatten()
+            .filter(|e| e.kind == DfgEdgeKind::Filled && e.resource == DataResource::Register(1))
+            .collect();
+        assert!(!filled.is_empty(), "expected a Filled r1 edge, got none");
+        let e = filled[0];
+        assert_eq!(e.source, DfgNode::Instruction(0));
+        assert_eq!(e.destination,   DfgNode::Instruction(1));
+    }
+
+    #[test]
+    fn dfg_write_after_write_edge_exists() {
+        let a = analyze_asm(r#"
+        .globl entrypoint
+        entrypoint:
+            mov64 r1, 1
+            mov64 r1, 2
+            exit
+        "#);
+        let waw: Vec<&DfgEdge> = a.dfg.forward.values().flatten()
+            .filter(|e| e.resource == DataResource::Register(1)
+                && e.source == DfgNode::Instruction(0)
+                && e.destination   == DfgNode::Instruction(1))
+            .collect();
+        assert!(!waw.is_empty(), "expected WAW edge on r1 from PC 0 to PC 1");
+    }
+
+    #[test]
+    fn dfg_mov_imm_is_pure_write() {
+        let a = analyze_asm(r#"
+        .globl entrypoint
+        entrypoint:
+            mov64 r1, 99
+            exit
+        "#);
+        let self_read: Vec<&DfgEdge> = a.dfg.forward.values().flatten()
+            .filter(|e| e.source == DfgNode::Instruction(0)
+                && e.destination == DfgNode::Instruction(0)
+                && e.resource == DataResource::Register(1))
+            .collect();
+        assert!(self_read.is_empty(), "mov imm must not create a self-read edge");
+    }
+
+    #[test]
+    fn dfg_memory_store_reads_register() {
+        let a = analyze_asm(r#"
+        .globl entrypoint
+        entrypoint:
+            mov64 r1, 42
+            stxdw [r10-8], r1
+            exit
+        "#);
+        let filled: Vec<&DfgEdge> = a.dfg.forward.values().flatten()
+            .filter(|e| e.destination == DfgNode::Instruction(1)
+                && e.kind == DfgEdgeKind::Filled
+                && e.resource == DataResource::Register(1))
+            .collect();
+        assert!(!filled.is_empty(), "stxdw must read r1 from PC 0");
+    }
+
+    #[test]
+    fn dfg_memory_load_reads_memory() {
+        let a = analyze_asm(r#"
+        .globl entrypoint
+        entrypoint:
+            ldxdw r1, [r10-8]
+            exit
+        "#);
+        let mem: Vec<&DfgEdge> = a.dfg.forward.values().flatten()
+            .filter(|e| e.destination == DfgNode::Instruction(0)
+                && matches!(e.resource, DataResource::Memory))
+            .collect();
+        assert!(!mem.is_empty(), "ldxdw must have an incoming memory edge");
+    }
+
+    #[test]
+    fn dfg_conditional_jump_reads_register() {
+        let a = analyze_asm(r#"
+        .globl entrypoint
+        entrypoint:
+            mov64 r2, 5
+            jeq r2, 5, done
+            mov64 r0, 1
+        done:
+            exit
+        "#);
+        let filled: Vec<&DfgEdge> = a.dfg.forward.values().flatten()
+            .filter(|e| e.destination == DfgNode::Instruction(1)
+                && e.kind == DfgEdgeKind::Filled
+                && e.resource == DataResource::Register(2))
+            .collect();
+        assert!(!filled.is_empty(), "jeq imm must read r2");
+    }
+
+    #[test]
+    fn dfg_conditional_jump_reg_reads_both_registers() {
+        let a = analyze_asm(r#"
+        .globl entrypoint
+        entrypoint:
+            mov64 r1, 3
+            mov64 r2, 3
+            jeq r1, r2, done
+            mov64 r0, 1
+        done:
+            exit
+        "#);
+        let reads_r1 = a.dfg.forward.values().flatten()
+            .any(|e| e.destination == DfgNode::Instruction(2)
+                && e.resource == DataResource::Register(1)
+                && e.kind == DfgEdgeKind::Filled);
+        let reads_r2 = a.dfg.forward.values().flatten()
+            .any(|e| e.destination == DfgNode::Instruction(2)
+                && e.resource == DataResource::Register(2)
+                && e.kind == DfgEdgeKind::Filled);
+        assert!(reads_r1, "jeq reg must read r1");
+        assert!(reads_r2, "jeq reg must read r2");
+    }
+
+    #[test]
+    fn dfg_phi_node_at_merge_point() {
+        let a = analyze_asm(r#"
+        .globl entrypoint
+        entrypoint:
+            mov64 r0, 1
+            jeq r0, 1, merge
+            mov64 r1, 0
+        merge:
+            mov64 r2, r1
+            exit
+        "#);
+        let has_phi = a.dfg.forward.keys()
+            .any(|n| matches!(n, DfgNode::Phi(_)));
+        assert!(has_phi, "merge block must have at least one Phi node");
+    }
+
+    #[test]
+    fn dfg_forward_reverse_consistent() {
+        let a = analyze_asm(r#"
+        .globl entrypoint
+        entrypoint:
+            mov64 r1, 1
+            mov64 r2, r1
+            add64 r2, r1
+            exit
+        "#);
+        for (from_node, edges) in &a.dfg.forward {
+            for edge in edges {
+                let reverse_has = a.dfg.reverse.get(&edge.destination)
+                    .map(|rev| rev.iter().any(|e| e.source == *from_node && e.resource == edge.resource))
+                    .unwrap_or(false);
+                assert!(reverse_has, "forward edge {from_node:?}→{:?} missing from reverse", edge.destination);
+            }
+        }
+    }
+
+    #[test]
+    fn counter_example_dfg_non_empty() {
+        let src = include_str!(
+            "../../../examples/sbpf-asm-counter/src/sbpf-asm-counter/sbpf-asm-counter.s"
+        );
+        let a = analyze_asm(src);
+        assert!(!a.dfg.forward.is_empty(), "DFG must be non-empty");
+    }
+}
