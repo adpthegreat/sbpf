@@ -87,49 +87,71 @@ impl ControlFlowGraph {
             };
         }
 
+        // Build slot maps: each instruction occupies 1 slot, except `lddw` which
+        // occupies 2 (it encodes a 64-bit immediate across two 8-byte words).
+        // Anza uses `insn.ptr` (slot index) as the  block-start PC, so
+        // we gonna do the same here to keep the two CFGs structurally identical.
+       let mut idx_to_slot: Vec<usize> = Vec::with_capacity(instructions.len());
+       let mut slot_to_idx: BTreeMap<usize, usize> = BTreeMap::new();
+        {
+            let mut slot = 0usize;            
+            for (idx, inst) in instructions.iter().enumerate() {
+                idx_to_slot.push(slot);
+                slot_to_idx.insert(slot, idx);
+                slot += if inst.opcode == Opcode::Lddw { 2 } else { 1 };
+            }
+        }
+
+        // Helper: instruction index → slot number.
+        let s = |idx: usize| idx_to_slot[idx];
+
+        // block_starts: set of slot numbers that begin a basic block.
         let mut block_starts: BTreeSet<usize> = BTreeSet::new();
         block_starts.insert(0);
 
         let mut explicit_edges: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
 
+        let n = instructions.len();
         for (pc, inst) in instructions.iter().enumerate() {
             match inst.opcode {
                 Opcode::Ja => {
-                    let target = jump_target(pc, inst);
-                    block_starts.insert(pc + 1); // start of "dead" fall-through slot
-                    if let Some(t) = target {
-                        block_starts.insert(t);
-                        explicit_edges.insert(pc, vec![t]);
+                    // The slot immediately after a `ja` is dead code; still
+                    // marks a block boundary.
+                    block_starts.insert(s(pc) + 1);
+                    if let Some(t) = jump_target(pc, inst) {
+                        block_starts.insert(s(t));
+                        explicit_edges.insert(pc, vec![s(t)]);
                     } else {
                         explicit_edges.insert(pc, vec![]);
                     }
                 }
 
                 op if is_conditional_jump(op) => {
-                    let ft = pc + 1; // fall-through (not-taken)
-                    block_starts.insert(ft);
+                    let ft_slot = if pc + 1 < n { s(pc + 1) } else { s(pc) + 1 };
+                    block_starts.insert(ft_slot);
                     if let Some(t) = jump_target(pc, inst) {
-                        block_starts.insert(t);
-                        explicit_edges.insert(pc, vec![ft, t]);
+                        block_starts.insert(s(t));
+                        explicit_edges.insert(pc, vec![ft_slot, s(t)]);
                     } else {
-                        explicit_edges.insert(pc, vec![ft]);
+                        explicit_edges.insert(pc, vec![ft_slot]);
                     }
                 }
 
-                Opcode::Call => {
-                    let ft = pc + 1;
-                    block_starts.insert(ft);
-                    explicit_edges.insert(pc, vec![ft]);
+                Opcode::Call if !inst.is_syscall() => {
+                    let ft_slot = if pc + 1 < n { s(pc + 1) } else { s(pc) + 1 };
+                    block_starts.insert(ft_slot);
+                    explicit_edges.insert(pc, vec![ft_slot]);
                 }
 
                 Opcode::Callx => {
-                    let ft = pc + 1;
-                    block_starts.insert(ft);
-                    explicit_edges.insert(pc, vec![ft]);
+                    let ft_slot = if pc + 1 < n { s(pc + 1) } else { s(pc) + 1 };
+                    block_starts.insert(ft_slot);
+                    explicit_edges.insert(pc, vec![ft_slot]);
                 }
 
                 Opcode::Exit => {
-                    block_starts.insert(pc + 1);
+                    // The slot after an `exit` might be a function entry.
+                    block_starts.insert(s(pc) + 1);
                     explicit_edges.insert(pc, vec![]);
                 }
 
@@ -141,43 +163,47 @@ impl ControlFlowGraph {
         let valid_starts: Vec<usize> = block_starts
             .iter()
             .copied()
-            .filter(|&s| s < n)
+            .filter(|sl| slot_to_idx.contains_key(sl))
             .collect();
 
         let mut blocks: BTreeMap<usize, BasicBlock> = BTreeMap::new();
-        for &s in &valid_starts {
-            blocks.insert(s, BasicBlock::default());
+        for &sl in &valid_starts {
+            blocks.insert(sl, BasicBlock::default());
         }
 
         let starts_vec: Vec<usize> = blocks.keys().copied().collect();
-        for (i, &block_start) in starts_vec.iter().enumerate() {
-            let block_end = if i + 1 < starts_vec.len() {
-                starts_vec[i + 1]
+        let starts_vec: Vec<usize> = blocks.keys().copied().collect(); // sorted slots
+        for (i, &block_start_slot) in starts_vec.iter().enumerate() {
+            // Instruction-index range [start_idx, end_idx).
+            let start_idx = slot_to_idx[&block_start_slot];
+            let end_idx = if i + 1 < starts_vec.len() {
+                slot_to_idx[&starts_vec[i + 1]]
             } else {
                 n
             };
 
-            let last_pc = block_end - 1;
+            let last_inst_idx = end_idx - 1;
             // Look up explicit edge from last instruction.
-            let successors = if let Some(dests) = explicit_edges.get(&last_pc) {
+            let successors = if let Some(dests) = explicit_edges.get(&last_inst_idx) {
                 dests
                     .iter()
                     .copied()
-                    .filter(|&d| blocks.contains_key(&d) || valid_starts.binary_search(&d).is_ok())
+                    .filter(|d| slot_to_idx.contains_key(d))
                     .collect::<Vec<_>>()
             } else {
                 // Implicit fall-through to next block (if there is one and the
                 // last instruction is not a terminator).
-                if let Some(&next_start) = starts_vec.get(i + 1) {
-                    vec![next_start]
+                 // Implicit fall-through (the last instruction is not a terminator).
+               if let Some(&next_start_slot) = starts_vec.get(i + 1) {
+                    vec![next_start_slot]
                 } else {
                     vec![]
                 }
             };
             
-            let block = blocks.get_mut(&block_start).unwrap();
-            block.start = block_start;
-            block.end = block_end;
+            let block = blocks.get_mut(&block_start_slot).unwrap();
+            block.start = start_idx;  // instruction index (for instruction array indexing)
+            block.end = end_idx;      // instruction index (exclusive)
 
             block.successors = successors;
         }
@@ -448,10 +474,11 @@ mod tests {
     #[test]
     fn same_target_cfg_block_count() {
         let a = Analysis::from_elf_bytes(ELF_SAME_TARGET).unwrap();
-        // PC0: call → splits to PC1. PC1: ja → splits to PC2.
-        // PC2: lddw (no split). PC3: call → splits to PC4. PC4: exit.
-        // Blocks: {0},{1},{2,3},{4} = 4 blocks.
-        assert_eq!(a.cfg.blocks.len(), 4);
+          // slot 0: call fn_0010 (local — splits).
+        // slot 1: ja jmp_0010 (splits).
+        // slot 2–5: lddw + syscall + exit.
+        // Blocks: {slot 0}, {slot 1}, {slot 2} = 3 blocks.
+        assert_eq!(a.cfg.blocks.len(), 3);
     }
 
     #[test]
@@ -473,9 +500,11 @@ mod tests {
     #[test]
     fn with_labels_back_edge_to_jmp_0010() {
         let a = Analysis::from_elf_bytes(ELF_WITH_LABELS).unwrap();
-        // jmp_0038 block ends with `ja jmp_0010` at PC 9.
-        // `call fn_0088` at PC 8 splits the block so PC 9 is its own block.
-        assert_eq!(a.cfg.blocks[&9].successors, vec![2]);
+        // jmp_0038 block ends with `ja jmp_0010` at PC 9 (instruction index),
+        // which lives in slot 11 (two lddw instructions before it add 2 extra slots).
+        // The `call fn_0088` at instruction index 8 (a local call) splits the block
+        // so index 9 / slot 11 is its own block.
+        assert_eq!(a.cfg.blocks[&11].successors, vec![2]);
     }
 
     #[test]
@@ -507,8 +536,9 @@ mod tests {
     #[test]
     fn same_target_exit_block_no_successors() {
         let a = Analysis::from_elf_bytes(ELF_SAME_TARGET).unwrap();
-        // PC4 is `exit` — the last block, no successors.
-        assert!(a.cfg.blocks[&4].successors.is_empty());
+        // The lddw+syscall+exit block starts at slot 2 (lddw takes 2 slots: 2-3,
+        // syscall is at slot 4, exit at slot 5).
+        assert!(a.cfg.blocks[&2].successors.is_empty());
     }
 
     #[test]
@@ -525,10 +555,9 @@ mod tests {
    #[test]
     fn v3_block_structure() {
         let a = Analysis::from_elf_bytes(ELF_V3).unwrap();
-        // PC0: lddw. PC1: call sol_log_64_ → splits to PC2. PC2: exit.
-        // Blocks: {0,1},{2} = 2 blocks.
-        assert_eq!(a.cfg.blocks.len(), 2);
-        assert!(a.cfg.blocks[&2].successors.is_empty());
+        // lddw (slot 0-1), syscall (slot 2), exit (slot 3).
+        assert_eq!(a.cfg.blocks.len(), 1);
+        assert!(a.cfg.blocks[&0].successors.is_empty());
     }
 
     #[test]

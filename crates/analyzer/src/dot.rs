@@ -12,14 +12,14 @@ pub fn cfg_to_dot(cfg: &ControlFlowGraph, instructions: &[Instruction]) -> Strin
             .map(|pc| {
                 let inst = &instructions[pc];
                 let asm = inst.to_asm().unwrap_or_else(|_| format!("{:?}", inst.opcode));
-                format!("{pc}: {asm}\\l")
+                format!("{}\\l", escape_dot(&format!("{pc}: {asm}")))
             })
             .collect();
 
         let label = format!(
             "{{{}|{}}}",
             escape_dot(&block.label),
-            escape_dot(&insts)
+            insts
         );
         out.push_str(&format!(
             "    bb_{start} [label=\"{label}\" shape=record];\n"
